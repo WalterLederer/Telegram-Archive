@@ -689,9 +689,54 @@ def _sanitize_theme_slug(value: str) -> str:
     return value if re.fullmatch(r"[a-z]{3,16}", value) else ""
 
 
+def _sanitize_chat_background(value: str) -> str:
+    """The chat wallpaper's file name under /static, or "" for none.
+
+    A bare name: no separator can appear, so the value cannot address anything
+    outside the static directory, and no quote, parenthesis, semicolon or angle
+    bracket can appear, so it cannot break out of the CSS declaration it is
+    baked into. Anything else is dropped rather than escaped, like the theme
+    slug above. A name that matches but does not exist simply 404s and the pane
+    keeps its plain background.
+    """
+    value = value.strip()
+    return value if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) else ""
+
+
+def _chat_background_css(name: str) -> str:
+    """The declarations that turn the wallpaper on, or "" when there is none.
+
+    Injected at the end of :root so it overrides the defaults declared there.
+    The bubbles go opaque with it: the themes make them translucent so the flat
+    background shows through, and over a photo that would put a picture behind
+    running text. The tint is the theme's own background colour, so one image
+    sits correctly under a light and a dark palette instead of only one of them.
+    """
+    if not name:
+        return ""
+    return (
+        f"--viewer-chat-background: url('/static/{name}');"
+        " --viewer-chat-tint: linear-gradient(rgb(var(--tg-bg) / 0.55), rgb(var(--tg-bg) / 0.55));"
+        " --tg-bubble-alpha-own: 1; --tg-bubble-alpha-other: 1;"
+        " --tg-chip-bg: rgb(var(--tg-sidebar));"
+        " --tg-service-bg: rgb(var(--tg-other)); --tg-service-fg: rgb(var(--tg-text));"
+        " --tg-pane-note-opacity: 1;"
+    )
+
+
 # Default palette for browsers with no saved choice. A user's picker choice
 # (localStorage) always wins over this.
 VIEWER_DEFAULT_THEME = _sanitize_theme_slug(os.getenv("VIEWER_DEFAULT_THEME", ""))
+VIEWER_CHAT_BACKGROUND = _sanitize_chat_background(os.getenv("VIEWER_CHAT_BACKGROUND", ""))
+_configured_chat_background = os.getenv("VIEWER_CHAT_BACKGROUND", "").strip()
+if _configured_chat_background and not VIEWER_CHAT_BACKGROUND:
+    # A name that cannot be a name: say so, or the pane is just silently plain.
+    logger.warning("VIEWER_CHAT_BACKGROUND is not a plain file name and was ignored")
+elif VIEWER_CHAT_BACKGROUND and not (Path(__file__).parent / "static" / VIEWER_CHAT_BACKGROUND).is_file():
+    logger.warning(
+        "VIEWER_CHAT_BACKGROUND names a file the viewer cannot see; mount it into the "
+        "container's static directory (see docker-compose.yml)"
+    )
 
 VIEWER_USERNAME = os.getenv("VIEWER_USERNAME", "").strip()
 VIEWER_PASSWORD = os.getenv("VIEWER_PASSWORD", "").strip()
@@ -1691,6 +1736,65 @@ async def serve_media(
     return response
 
 
+@app.get("/api/search/messages")
+async def search_messages(
+    q: str = Query(..., min_length=1, max_length=500),
+    user: UserContext = Depends(require_auth),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0, le=5000),
+):
+    """Message text across every chat the caller may see — the sidebar's Messages section.
+
+    Word-prefix matching over the full-text index, newest first. Restricted
+    viewers are filtered in SQL through the same ChatScope as the chat list
+    and the tag view, so this route can never widen what a viewer sees. Each
+    row names its chat the way the chat list does (title, or first/last name
+    for a private chat) and addresses the jump by ref, never by id.
+    """
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+    try:
+        payload = await db.search_messages_global(q, scope=_chat_scope(user), limit=limit, offset=offset)
+    except Exception as e:
+        # Type name only: SQLAlchemy exception text can echo statement
+        # parameters — the search text and the viewer's scope grants.
+        logger.error(f"Error searching messages: {type(e).__name__}")
+        if _is_db_connection_error(e):
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    results = []
+    for row in payload["results"]:
+        results.append(
+            {
+                "id": row["id"],
+                "date": row["date"],
+                "text": row["text"],
+                "sender_name": row["sender_name"],
+                "is_deleted": row["is_deleted"],
+                "topic_title": row["topic_title"],
+                "chat": {
+                    "ref": row["chat_ref"],
+                    "title": row["chat_title"],
+                    "first_name": row["chat_first_name"],
+                    "last_name": row["chat_last_name"],
+                    "username": row["chat_username"],
+                    "type": row["chat_type"],
+                    "is_forum": row["chat_is_forum"],
+                    "avatar_url": _chat_avatar_url(row["chat_id"], row["chat_type"], row["chat_ref"]),
+                },
+            }
+        )
+    return {
+        "query": q,
+        "limit": limit,
+        "offset": offset,
+        "has_more": payload["has_more"],
+        "indexed": payload["indexed"],
+        "results": results,
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
     """Serve the main application page.
@@ -1701,6 +1805,7 @@ async def read_root():
     """
     html = (templates_dir / "index.html").read_text(encoding="utf-8")
     html = html.replace("__VIEWER_DEFAULT_THEME__", VIEWER_DEFAULT_THEME)
+    html = html.replace("__VIEWER_CHAT_BACKGROUND__", _chat_background_css(VIEWER_CHAT_BACKGROUND))
     return HTMLResponse(
         html,
         headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
@@ -2218,6 +2323,23 @@ def _encode_media_key(media_key: str) -> str:
     return quote(media_key, safe="")
 
 
+def _chat_avatar_url(chat_id: int | None, chat_type: str | None, ref: str | None) -> str | None:
+    """Ref-addressed avatar URL when an avatar is cached, else None.
+
+    The avatar bytes route re-resolves at serve time; this only decides whether
+    the viewer renders an <img> at all. Any lookup failure reads as "no avatar"
+    rather than failing the row it decorates.
+    """
+    if chat_id is None or not ref:
+        return None
+    try:
+        return f"/media/avatar/{ref}" if _get_cached_avatar_path(chat_id, chat_type or "private") else None
+    except Exception as e:
+        # Type name only: an OSError's text carries the chat-derived path.
+        logger.error(f"Error finding avatar for a chat: {type(e).__name__}")
+        return None
+
+
 def _get_cached_avatar_path(chat_id: int, chat_type: str) -> str | None:
     """Get avatar path with caching."""
     global _avatar_cache, _avatar_cache_time
@@ -2312,12 +2434,7 @@ async def get_chats(
         # Ref-addressed avatar URLs; the avatar bytes route re-resolves at serve
         # time, this only decides whether the viewer renders an <img> at all.
         for chat in chats:
-            try:
-                avatar_path = _get_cached_avatar_path(chat["id"], chat.get("type", "private"))
-                chat["avatar_url"] = f"/media/avatar/{chat['ref']}" if avatar_path else None
-            except Exception as e:
-                logger.error(f"Error finding avatar for a chat: {e}")
-                chat["avatar_url"] = None
+            chat["avatar_url"] = _chat_avatar_url(chat.get("id"), chat.get("type"), chat.get("ref"))
 
         return {
             "chats": chats,
@@ -2331,6 +2448,27 @@ async def get_chats(
         if _is_db_connection_error(e):
             raise HTTPException(status_code=503, detail="Database temporarily unavailable")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/api/chats/{chat_ref}")
+async def get_chat(chat: ChatContext = Depends(require_chat)):
+    """One chat by its opaque ref, shaped like a chat-list row.
+
+    Deep links (push notifications, shared message links, global search hits)
+    can point at any entitled chat, not just the page the sidebar has loaded;
+    this is how the viewer resolves the rest without paging the whole list.
+    """
+    try:
+        row = await db.get_chat_by_ref(chat.ref, account_id=chat.account_id)
+    except Exception as e:
+        logger.error(f"Error fetching chat: {type(e).__name__}")
+        if _is_db_connection_error(e):
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    if not row:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    row["avatar_url"] = _chat_avatar_url(row["id"], row.get("type"), row["ref"])
+    return row
 
 
 @app.get("/api/chats/{chat_ref}/messages")

@@ -567,9 +567,9 @@ def test_pagination_reset_called_at_all_entry_points():
     """Every view-switching entry point must reset history pagination before loading."""
     html = INDEX_HTML.read_text(encoding="utf-8")
 
-    topic_start = html.index("const selectTopic = async (chat, topic) =>")
+    topic_start = html.index("const selectTopic = async (chat, topic, options = {}) =>")
     topic_body = html[topic_start : html.index("const activeTab = computed", topic_start)]
-    chat_start = html.index("const selectChat = async (chat) =>")
+    chat_start = html.index("const selectChat = async (chat, options = {}) =>")
     chat_body = html[chat_start : html.index("const startMessageRefresh = () =>", chat_start)]
     search_start = html.index("const searchMessages = async () =>")
     search_body = html[search_start : html.index("const handleScroll = (e) =>", search_start)]
@@ -577,6 +577,54 @@ def test_pagination_reset_called_at_all_entry_points():
     assert "resetMessagePagination()" in topic_body
     assert "resetMessagePagination()" in chat_body
     assert "resetMessagePagination()" in search_body
+
+
+def test_chat_wallpaper_is_a_theme_token_not_a_per_render_style_read():
+    """The bubble alpha switches in CSS, so no bubble reads computed style to draw itself.
+
+    getMessageBackground runs once per bubble per render, on every poll tick.
+    Reading a custom property off documentElement there forces a style
+    recalculation for a value the server fixed before the page was sent.
+    """
+    html = INDEX_HTML.read_text(encoding="utf-8")
+
+    start = html.index("const getMessageBackground = (msg) =>")
+    body = html[start : html.index("\n                const ", start + 10)]
+    assert "getComputedStyle" not in body
+    assert "rgb(var(--tg-own) / var(--tg-bubble-alpha-own))" in body
+    assert "rgb(var(--tg-other) / var(--tg-bubble-alpha-other))" in body
+
+    # The defaults are the translucency the themes are drawn with, and the
+    # server's block is the last thing in :root so it can override them.
+    root = html[html.index("        :root {\n            --tg-bg:") :]
+    root = root[: root.index("\n        }")]
+    assert "--viewer-chat-background: none;" in root
+    assert "--viewer-chat-tint: none;" in root
+    assert "--tg-bubble-alpha-own: 0.95;" in root
+    assert "--tg-bubble-alpha-other: 0.80;" in root
+    # The other surfaces that float over the pane are translucent by design and
+    # unreadable over a picture, so they carry tokens too. Every default here is
+    # the value the pane already used: with no wallpaper, nothing changes.
+    assert "--tg-chip-bg: rgb(var(--tg-sidebar) / 0.85);" in root
+    assert "--tg-service-bg: rgba(0, 0, 0, 0.3);" in root
+    assert "--tg-service-fg: rgba(255, 255, 255, 0.8);" in root
+    assert "--tg-pane-note-opacity: 0.5;" in root
+    assert "background-color: var(--tg-chip-bg);" in html
+    assert 'style="background: var(--tg-service-bg); color: var(--tg-service-fg);"' in html
+    assert "opacity: 'var(--tg-pane-note-opacity)'" in html
+    # Nothing may keep the hardcoded fills those tokens replaced.
+    assert "background: rgba(0,0,0,0.3)" not in html
+    assert "background-color: rgb(var(--tg-sidebar) / 0.85)" not in html
+    assert root.index("--tg-bubble-alpha-own: 0.95;") < root.index("__VIEWER_CHAT_BACKGROUND__")
+    assert html.count("__VIEWER_CHAT_BACKGROUND__") == 1
+
+    # The pane paints the tint over the image; both are none until the server says otherwise.
+    pane_start = html.index("        .messages-scroll {")
+    pane = html[pane_start : html.index("\n        }", pane_start)]
+    assert "background-image: var(--viewer-chat-tint), var(--viewer-chat-background);" in pane
+    # `fixed` repaints the whole layer per scroll frame in mobile Safari, and this
+    # pane is the viewport for its own scrolling, so the default already holds it still.
+    assert "background-attachment" not in pane
 
 
 def test_topic_filter_mirrors_backend_default():
@@ -871,12 +919,12 @@ def test_pane_topic_scope_survives_sidebar_navigation():
     assert "selectedPaneTopic.value?.id" in active_body
     assert "currentNav.value" not in active_body
 
-    topic_start = html.index("const selectTopic = async (chat, topic) =>")
+    topic_start = html.index("const selectTopic = async (chat, topic, options = {}) =>")
     topic_body = html[topic_start : html.index("const activeTab = computed", topic_start)]
     assert "selectedPaneTopic.value = topic" in topic_body
     assert topic_body.index("selectedPaneTopic.value = topic") < topic_body.index("await loadMessages()")
 
-    chat_start = html.index("const selectChat = async (chat) =>")
+    chat_start = html.index("const selectChat = async (chat, options = {}) =>")
     chat_body = html[chat_start : html.index("const startMessageRefresh", chat_start)]
     assert "selectedPaneTopic.value = null" in chat_body
 
@@ -2022,8 +2070,8 @@ const loadMessagesAroundId = async (messageId) => {
                 "const GENERAL_TOPIC_ID = ",
                 "const activeTopicId = () => {",
                 "const openForumTopics = async (chat) =>",
-                "const selectTopic = async (chat, topic) =>",
-                "const selectChat = async (chat) =>",
+                "const selectTopic = async (chat, topic, options = {}) =>",
+                "const selectChat = async (chat, options = {}) =>",
             ),
             prelude,
             # focusAudioTrackMessage is followed by audioEngine listener wiring,
@@ -2498,6 +2546,7 @@ const loadingNewer = { value: false }
 const newerLoadError = { value: '' }
 const viewingPinnedWindow = { value: false }
 const unseenMessageCount = { value: 0 }
+const messageHighlight = { value: null }
 const messageWindowIsContiguous = { value: false }
 const isAuthenticated = { value: true }
 const messageSearchQuery = { value: '' }
@@ -3265,6 +3314,7 @@ const loadingNewer = ref(false)
 const newerLoadError = ref('')
 const viewingPinnedWindow = ref(false)
 const unseenMessageCount = ref(0)
+const messageHighlight = ref(null)
 const isAuthenticated = ref(true)
 const messageSearchQuery = ref('')
 const selectedChat = ref({ id: 7, ref: 'r7', title: 'chat' })

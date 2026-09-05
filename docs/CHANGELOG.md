@@ -4,6 +4,56 @@ All notable changes to this project are documented here.
 
 For upgrade instructions, see [Upgrading](#upgrading) at the bottom.
 
+## [8.8.0] - 2026-09-04
+
+An optional wallpaper behind the messages.
+
+### Added
+
+- **`VIEWER_CHAT_BACKGROUND` puts a picture behind the conversation**, the way the apps let you set a chat background. Name a file the viewer serves from `/static` and mount it into the container; leave it unset and the viewer looks exactly as it does today. While it is on, the message bubbles turn opaque, because the themes draw them translucent over a flat colour and a photo behind running text is not readable, and the image is tinted with the palette's own background colour, so one picture works under a light and a dark theme instead of only one of them. Contributed by [@WalterLederer](https://github.com/WalterLederer) in [#432](https://github.com/GeiserX/Telegram-Archive/pull/432).
+
+### Note
+
+The file name is validated as a bare name, so it cannot address anything outside the static directory or add declarations to the stylesheet it is baked into. A name that does not resolve simply leaves the pane plain.
+
+## [8.7.0] - 2026-09-04
+
+Search results are emphasised inside the message, not only in the sidebar.
+
+### Added
+
+- **Matches are marked inside the message.** Opening a search result already jumped to the message and flashed it; the words that matched are now emphasised in the message itself, so a hit in a long message no longer has to be hunted for. The in-chat filter does the same for every row it shows, on each page the scroll loads. The marks end when their search does, and they survive the three-second refresh and a newly loaded page. Contributed by [@WalterLederer](https://github.com/WalterLederer) in [#431](https://github.com/GeiserX/Telegram-Archive/pull/431).
+
+### Fixed
+
+- **Search emphasis follows the rule the search itself used.** The sidebar preview marked whole words that start with any word of the query, which is what the archive matches on, but nothing else did. Matching now runs through one rule everywhere, so a two-word query emphasises both words wherever they appear, a prefix emphasises the whole word it found, and a query is no longer emphasised inside an unrelated word that was never a match.
+- **Accented words are emphasised.** On SQLite, the archive folds accents when it searches: a search for `mas` finds a message reading "más". The preview and the message showed that hit with nothing emphasised at all. Both fold accents now, which also fixes the sidebar preview shipped in 8.6.0.
+- **A word split by formatting is emphasised.** A word written half in bold, or inside a link, is one word to the archive and several pieces to the browser, so it was matched by the search and then emphasised nowhere.
+
+### Note
+
+No database change, and no change to what the search finds — only to what is emphasised once it has found it. The viewer half takes effect as soon as you pull the viewer image.
+
+## [8.6.0] - 2026-09-03
+
+Search finds messages across the whole archive, from the one field the sidebar already had.
+
+### Added
+
+- **Global message search.** The sidebar's search field now looks for message text across every chat you can see, not only chat names. Results come in two sections, Chats then Messages, the way the official clients show them: each message hit carries the chat's avatar and name, the sender, the matched words emphasised in a snippet windowed on the first match, the topic for forum hits, and the list loads more as it is scrolled. Arrow keys move through the hits, Enter opens one and Esc clears the field. Opening a hit lands on the message inside its chat and topic, with the results kept in the sidebar. Contributed by [@WalterLederer](https://github.com/WalterLederer) in [#429](https://github.com/GeiserX/Telegram-Archive/pull/429).
+- **`GET /api/search/messages` and `GET /api/chats/{ref}`.** The search route answers word-prefix matches newest first, scoped in SQL by the same entitlements as the chat list, and pages by offset up to 5,000 hits. The chat route resolves one chat by its opaque ref, which is how deep links now reach chats beyond the sidebar's first page.
+
+### Fixed
+
+- **Search stays fast on any archive.** On PostgreSQL the planner cannot see how selective a word-prefix term is, so it walked the whole date index for rare or absent words: 2 to 9 seconds on a 2.9M-message archive. The search now counts hits through the index first, capped, and takes the path that is bounded for that answer, so common, rare and absent words all answer in under 100 ms there. SQLite reads the sorted hit set directly.
+- **A deep link with no message id opens the chat, and a failed jump no longer leaves an empty pane.** The jump-to-message path skips the chat's normal first page because the window around the message replaces it; that skip now happens only when there is a message to jump to, and when the window cannot be loaded the chat falls back to its newest page. The playbar's jump to the playing track had the same race as notification links and gets the same fix.
+- **Deep links reach every chat.** A notification or shared link into a chat outside the sidebar's first thousand said "Could not open that chat". Chats resolve by ref now.
+- **Light themes: text on solid accent buttons and tabs is white in all thirteen places, not two.** Only the active folder tab had been fixed for Day and Paper; the other controls kept dark text on the blue.
+
+### Note
+
+No database change. The viewer half takes effect as soon as you pull the viewer image; the backup image carries no behaviour change.
+
 ## [8.5.0] - 2026-08-30
 
 Round videos are circles, and media brought in from a Telegram Desktop export works like every other file.
