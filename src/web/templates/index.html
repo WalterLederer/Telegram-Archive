@@ -1693,6 +1693,7 @@
                                  decided by the service branch above; see isRenderedMessageRow. -->
                             <div v-else-if="!isHiddenAlbumMessage(msg, index)" :data-msg-id="msg.id"
                                 class="flex items-end gap-2"
+                                @click="selectMessage(msg)"
                                 :class="[isOwnMessage(msg) ? 'justify-end' : 'justify-start', isSenderBreak(index) ? 'message-run-break' : 'message-run-continue']">
                                 <!-- Sender avatar gutter (#229): group + non-own only.
                                      Circle renders at the run start (alongside the name);
@@ -2143,6 +2144,254 @@
                     </template>
                 </template>
             </div>
+
+            <!-- Message Info Panel -->
+            <aside v-if="showInfoPanel"
+                class="absolute right-0 top-0 bottom-0 w-[360px] max-w-[90vw] bg-tg-sidebar border-l border-tg-n700 shadow-2xl z-30 flex flex-col">
+                <div class="flex items-center justify-between px-4 py-3 border-b border-tg-n700">
+                    <h2 class="text-lg font-semibold text-tg-ink">Information</h2>
+                    <button type="button"
+                        class="p-2 rounded-full hover:bg-tg-n700/50 text-tg-ink"
+                        @click="showInfoPanel = false"
+                        aria-label="Informationspanel schließen">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none"
+                            viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                    </button>
+                </div>
+
+                <div class="flex-1 overflow-y-auto p-4 space-y-4">
+
+                    <!-- Chat Information -->
+                    <div v-if="selectedChat">
+                        <h3 class="text-sm font-semibold text-tg-ink mb-2">
+                            Chat
+                        </h3>
+
+                        <div class="text-sm space-y-1 text-tg-muted">
+                            <div v-if="selectedChat.title">
+                                <span class="text-tg-ink">Titel:</span>
+                                {{ selectedChat.title }}
+                            </div>
+
+                            <div>
+                                <span class="text-tg-ink">ID:</span>
+                                {{ selectedChat.id }}
+                            </div>
+
+                            <div>
+                                <span class="text-tg-ink">Typ:</span>
+                                {{ selectedChat.type }}
+                            </div>
+
+                            <div v-if="selectedChat.username">
+                                <span class="text-tg-ink">Username:</span>
+                                @{{ selectedChat.username }}
+                            </div>
+
+                            <div v-if="selectedChat.participants_count">
+                                <span class="text-tg-ink">Teilnehmer:</span>
+                                {{ selectedChat.participants_count.toLocaleString('de-DE') }}
+                            </div>
+
+                            <div v-if="selectedChat.is_forum">
+                                <span class="text-tg-ink">Forum:</span>
+                                Ja
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Topic Information -->
+                    <div v-if="selectedPaneTopic">
+                        <h3 class="text-sm font-semibold text-tg-ink mb-2">
+                            Thema
+                        </h3>
+
+                        <div class="text-sm space-y-1 text-tg-muted">
+                            <div v-if="selectedPaneTopic.title">
+                                <span class="text-tg-ink">Titel:</span>
+                                {{ selectedPaneTopic.title }}
+                            </div>
+
+                            <div>
+                                <span class="text-tg-ink">ID:</span>
+                                {{ selectedPaneTopic.id }}
+                            </div>
+
+                            <div v-if="selectedPaneTopic.icon_emoji">
+                                <span class="text-tg-ink">Symbol:</span>
+                                {{ selectedPaneTopic.icon_emoji }}
+                            </div>
+
+                            <div v-if="selectedPaneTopic.is_pinned">
+                                <span class="text-tg-ink">Angeheftet:</span>
+                                Ja
+                            </div>
+
+                            <div v-if="selectedPaneTopic.is_closed">
+                                <span class="text-tg-ink">Geschlossen:</span>
+                                Ja
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Message Information -->
+                    <div v-if="selectedMessage">
+                        <h3 class="text-sm font-semibold text-tg-ink mb-2">
+                            Nachricht
+                        </h3>
+
+                        <div class="text-sm space-y-1 text-tg-muted">
+                            <div>
+                                <span class="text-tg-ink">ID:</span>
+                                {{ selectedMessage.id }}
+                            </div>
+
+                            <div v-if="selectedMessage.chat_id != null">
+                                <span class="text-tg-ink">Chat-ID:</span>
+                                {{ selectedMessage.chat_id }}
+                            </div>
+
+                            <div v-if="selectedMessage.sender_id != null">
+                                <span class="text-tg-ink">Sender-ID:</span>
+                                {{ selectedMessage.sender_id }}
+                            </div>
+
+                            <div v-if="selectedMessage.sender_name">
+                                <span class="text-tg-ink">Sender:</span>
+                                {{ selectedMessage.sender_name }}
+                            </div>
+
+                            <div>
+                                <span class="text-tg-ink">Datum:</span>
+                                {{ selectedMessage.date }}
+                            </div>
+
+                            <div v-if="selectedMessage.edit_date">
+                                <span class="text-tg-ink">Bearbeitet:</span>
+                                {{ selectedMessage.edit_date }}
+                            </div>
+
+                            <div v-if="selectedMessage.reply_to_msg_id != null">
+                                <span class="text-tg-ink">Antwort auf:</span>
+                                {{ selectedMessage.reply_to_msg_id }}
+                            </div>
+
+                            <div v-if="selectedMessage.reply_to_top_id != null">
+                                <span class="text-tg-ink">Antwort auf Topic:</span>
+                                {{ selectedMessage.reply_to_top_id }}
+                            </div>
+
+                            <div v-if="selectedMessage.raw_data?.grouped_id != null">
+                                <span class="text-tg-ink">Album-ID:</span>
+                                {{ selectedMessage.raw_data.grouped_id }}
+                            </div>
+
+                            <div>
+                                <span class="text-tg-ink">Richtung:</span>
+                                {{ selectedMessage.is_outgoing ? 'Ausgehend' : 'Eingehend' }}
+                            </div>
+
+                            <div v-if="selectedMessage.is_deleted">
+                                <span class="text-tg-ink">Gelöscht:</span>
+                                Ja
+                            </div>
+
+                            <div v-if="selectedMessage.is_pinned">
+                                <span class="text-tg-ink">Angeheftet:</span>
+                                Ja
+                            </div>
+
+                            <div v-if="selectedMessage.forward_from_id != null">
+                                <span class="text-tg-ink">Weitergeleitet von:</span>
+                                {{ selectedMessage.forward_from_id }}
+                            </div>
+
+                            <div v-if="selectedMessage.version_count">
+                                <span class="text-tg-ink">Versionen:</span>
+                                {{ selectedMessage.version_count }}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div v-if="selectedMessage && getInfoPanelMedia(selectedMessage).length">
+                        <h3 class="text-sm font-semibold text-tg-ink mb-2">
+                            Medien
+                        </h3>
+
+                        <div
+                            v-for="mediaMsg in getInfoPanelMedia(selectedMessage)"
+                            :key="mediaMsg.id"
+                            class="border border-tg-n700 rounded-lg p-3 space-y-2"
+                        >
+                            <div class="font-medium text-sm text-tg-ink break-all">
+                                {{ mediaMsg.media.file_name || 'Unbenannte Datei' }}
+                            </div>
+
+                            <div class="text-xs text-tg-muted space-y-1">
+                                <div>
+                                    <span class="text-tg-ink">Typ:</span>
+                                    {{ mediaMsg.media.type || '—' }}
+                                </div>
+
+                                <div v-if="mediaMsg.media.mime_type">
+                                    <span class="text-tg-ink">MIME:</span>
+                                    {{ mediaMsg.media.mime_type }}
+                                </div>
+
+                                <div v-if="mediaMsg.media.file_size != null">
+                                    <span class="text-tg-ink">Größe:</span>
+                                    {{ formatFileSize(mediaMsg.media.file_size) }}
+                                </div>
+
+                                <div v-if="mediaMsg.media.width && mediaMsg.media.height">
+                                    <span class="text-tg-ink">Abmessungen:</span>
+                                    {{ mediaMsg.media.width }} × {{ mediaMsg.media.height }}
+                                </div>
+                            </div>
+
+                            <div v-if="mediaMsg.media.file_path">
+                                <div class="flex items-center justify-between mb-1">
+                                    <div class="text-xs font-medium text-tg-ink">
+                                        Lokaler Pfad
+                                    </div>
+
+                                    <button
+                                        type="button"
+                                        class="text-xs text-tg-muted hover:text-tg-ink px-2 py-1 rounded hover:bg-tg-n700/50"
+                                        @click.stop="copyMediaPath(mediaMsg.media.file_path)"
+                                    >
+                                        Pfad kopieren
+                                    </button>
+                                </div>
+
+                                <div
+                                    class="text-xs text-tg-muted break-all bg-tg-bg rounded p-2 select-text"
+                                >
+                                    {{ mediaMsg.media.file_path }}
+                                </div>
+                            </div>
+
+                        </div>
+                    </div>
+
+                    <div v-else-if="selectedMessage" class="text-sm text-tg-muted">
+                        Diese Nachricht enthält keine lokalen Medien.
+                    </div>
+                </div>
+
+            </aside>
+
+            <!-- Copy Toast -->
+            <div
+                v-if="showCopyToast"
+                class="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-lg bg-gray-800 text-white text-sm shadow-xl"
+            >
+                Text kopiert
+            </div>
+
         </div>
 
         <!-- Date Picker Modal -->
@@ -2855,8 +3104,37 @@
                 const senderInfoCloseBtn = ref(null)
                 let senderInfoTrigger = null
                 const selectedChat = ref(null)
+                const selectedMessage = ref(null)
+                const showInfoPanel = ref(false)
+                const showCopyToast = ref(false)
+                let copyToastTimer = null
                 const selectedPaneTopic = ref(null)
                 const searchQuery = ref('')
+
+                const selectMessage = (msg) => {
+                    selectedMessage.value = msg
+                    showInfoPanel.value = true
+                }
+
+                const copyMediaPath = async (path) => {
+                    if (!path) return
+
+                    try {
+                        await navigator.clipboard.writeText(path)
+
+                        showCopyToast.value = true
+
+                        if (copyToastTimer) {
+                            clearTimeout(copyToastTimer)
+                        }
+
+                        copyToastTimer = setTimeout(() => {
+                            showCopyToast.value = false
+                        }, 1800)
+                    } catch (error) {
+                        console.error('Fehler beim Kopieren des Pfades:', error)
+                    }
+                }
 
                 // Sidebar search: one field, two result sections (chats, then messages).
                 const searchActive = computed(() => searchQuery.value.trim().length > 0)
@@ -5605,6 +5883,16 @@
 
                     // Find all messages in this album (compare as strings)
                     return sortedMessages.value.filter(m => getGroupedId(m) === groupedId)
+                }
+
+                const getInfoPanelMedia = (msg) => {
+                    const album = getAlbumForMessage(msg)
+
+                    if (album) {
+                        return album.filter(m => m.media?.file_path)
+                    }
+
+                    return msg?.media?.file_path ? [msg] : []
                 }
 
                 // Check if this message is the first in its album (render the album here)
@@ -8820,6 +9108,12 @@
                     filteredChats,
                     selectedChat,
                     selectedPaneTopic,
+                    selectedMessage,
+                    showInfoPanel,
+                    showCopyToast,
+                    selectMessage,
+                    copyMediaPath,
+                    getInfoPanelMedia,
                     messages,
                     versionsMessage,
                     versionsCloseBtn,
