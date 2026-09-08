@@ -11,8 +11,10 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import re
 import secrets
+import shlex
 import time
 import traceback
 from collections.abc import AsyncGenerator, Iterable
@@ -689,9 +691,59 @@ def _sanitize_theme_slug(value: str) -> str:
     return value if re.fullmatch(r"[a-z]{3,16}", value) else ""
 
 
+def _sanitize_chat_background(value: str) -> str:
+    """The chat wallpaper's file name under /static, or "" for none.
+
+    A bare name: no separator can appear, so the value cannot address anything
+    outside the static directory, and no quote, parenthesis, semicolon or angle
+    bracket can appear, so it cannot break out of the CSS declaration it is
+    baked into. Anything else is dropped rather than escaped, like the theme
+    slug above. A name that matches but does not exist simply 404s and the pane
+    keeps its plain background.
+    """
+    value = value.strip()
+    return value if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) else ""
+
+
+def _chat_background_css(name: str) -> str:
+    """The declarations that turn the wallpaper on, or "" when there is none.
+
+    Injected at the end of :root so it overrides the defaults declared there.
+    The bubbles go opaque with it: the themes make them translucent so the flat
+    background shows through, and over a photo that would put a picture behind
+    running text. The tint is the theme's own background colour, so one image
+    sits correctly under a light and a dark palette instead of only one of them.
+    """
+    if not name:
+        return ""
+    return (
+        f"--viewer-chat-background: url('/static/{name}');"
+        " --viewer-chat-tint: linear-gradient(rgb(var(--tg-bg) / 0.55), rgb(var(--tg-bg) / 0.55));"
+        " --tg-bubble-alpha-own: 1; --tg-bubble-alpha-other: 1;"
+        " --tg-chip-bg: rgb(var(--tg-sidebar));"
+        " --tg-service-bg: rgb(var(--tg-other)); --tg-service-fg: rgb(var(--tg-text));"
+        " --tg-pane-note-opacity: 1;"
+    )
+
+
+def _media_open_capabilities() -> dict:
+    """Which of the info panel's Open buttons the operator configured a command for."""
+    return {"file": bool(config.media_open_cmd), "path": bool(config.media_open_path_cmd)}
+
+
 # Default palette for browsers with no saved choice. A user's picker choice
 # (localStorage) always wins over this.
 VIEWER_DEFAULT_THEME = _sanitize_theme_slug(os.getenv("VIEWER_DEFAULT_THEME", ""))
+VIEWER_CHAT_BACKGROUND = _sanitize_chat_background(os.getenv("VIEWER_CHAT_BACKGROUND", ""))
+_configured_chat_background = os.getenv("VIEWER_CHAT_BACKGROUND", "").strip()
+if _configured_chat_background and not VIEWER_CHAT_BACKGROUND:
+    # A name that cannot be a name: say so, or the pane is just silently plain.
+    logger.warning("VIEWER_CHAT_BACKGROUND is not a plain file name and was ignored")
+elif VIEWER_CHAT_BACKGROUND and not (Path(__file__).parent / "static" / VIEWER_CHAT_BACKGROUND).is_file():
+    logger.warning(
+        "VIEWER_CHAT_BACKGROUND names a file the viewer cannot see; mount it into the "
+        "container's static directory (see docker-compose.yml)"
+    )
 
 VIEWER_USERNAME = os.getenv("VIEWER_USERNAME", "").strip()
 VIEWER_PASSWORD = os.getenv("VIEWER_PASSWORD", "").strip()
@@ -1691,6 +1743,184 @@ async def serve_media(
     return response
 
 
+# ---- Info panel "Open" buttons: operator-configured commands (native runs) ----
+#
+# A browser cannot open a file on the machine that serves it, so these buttons
+# only make sense where the viewer and the browser share that machine: a native
+# run, not the Docker deployment, where the container has no desktop and the
+# buttons would do nothing. Hence no implicit platform default (xdg-open / open /
+# os.startfile would execute whatever a sender uploaded), a button exists only
+# when the operator wrote the command for it, and only the master account can
+# press it. The values are quoted for the shell and substituted in one pass, so
+# a file name that spells a placeholder is never expanded a second time.
+
+_MEDIA_COMMAND_PLACEHOLDER = re.compile(r"%(PATH|DIR|FILENAME)%", re.IGNORECASE)
+# The command runs as the operator, on the operator's machine, so this is hygiene
+# rather than a boundary: the archive's own credentials (and the phone number the
+# project never logs) stay out of an environment a desktop opener has no use for.
+_MEDIA_COMMAND_SECRET_KEYS = re.compile(
+    r"PASSWORD|SECRET|TOKEN|API_HASH|PRIVATE_KEY|DATABASE_URL|WEBHOOK|TELEGRAM_PHONE", re.IGNORECASE
+)
+
+
+def _quote_media_command_value(value: str) -> str:
+    """One shell word for a substituted path, on the shell shell=True actually runs."""
+    if platform.system() == "Windows":
+        # Always one double-quoted word: cmd.exe reads & | < > ^ as syntax in a
+        # bare token and list2cmdline quotes only on whitespace. Inside quotes
+        # only %NAME% is still expanded, and there is no escape for it, so a
+        # name carrying '%' is refused; a quote cannot occur in a Windows name,
+        # and a line break would end the command.
+        if "%" in value or '"' in value or "\r" in value or "\n" in value:
+            raise ValueError("character the command line cannot carry")
+        return f'"{value}"'
+    return shlex.quote(value)
+
+
+def _render_media_command(template: str, file_path: Path) -> str:
+    """The operator's template with %PATH%, %DIR% and %FILENAME% filled in."""
+    values = {
+        "PATH": _quote_media_command_value(str(file_path)),
+        "DIR": _quote_media_command_value(str(file_path.parent)),
+        "FILENAME": _quote_media_command_value(file_path.name),
+    }
+    return _MEDIA_COMMAND_PLACEHOLDER.sub(lambda match: values[match.group(1).upper()], template)
+
+
+def _media_command_env() -> dict[str, str]:
+    return {key: value for key, value in os.environ.items() if not _MEDIA_COMMAND_SECRET_KEYS.search(key)}
+
+
+async def _launch_media_command(template: str, chat: ChatContext, media_key: str, *, inline_only: bool) -> dict:
+    """Start the operator's command on an entitled media file; the process is not awaited.
+
+    ``inline_only`` limits the file to the families the viewer renders inline
+    (images, video, audio, PDF): "Open" hands the file to an application, and
+    a sender's ``.exe``, ``.command`` or ``.desktop`` must never be that file.
+    Showing a folder reveals the file without running it, so it takes any type.
+    """
+    if not _media_root:
+        raise HTTPException(status_code=404, detail="Media directory not configured")
+    row = await _entitled_media_row(chat, media_key)
+    relative = _media_relative_path(row.get("file_path"))
+    resolved = _resolve_media_file(relative) if relative else None
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    if inline_only and _inline_media_type(resolved.name) is None:
+        raise HTTPException(status_code=415, detail="File type cannot be opened")
+    try:
+        command = _render_media_command(template, resolved)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="File name cannot be passed to the command") from None
+    try:
+        # asyncio reaps the child, so nothing is left as a zombie; a new session
+        # keeps a long-lived viewer app from dying with the server's signals.
+        process = await asyncio.create_subprocess_shell(
+            command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+            env=_media_command_env(),
+        )
+    except OSError as e:
+        logger.warning(f"Media open command failed to start ({type(e).__name__})")
+        raise HTTPException(status_code=500, detail="Command failed to start") from e
+    # A viewer app keeps running; a command that cannot start (a missing binary,
+    # a bad flag) is gone within milliseconds, and that is worth saying.
+    try:
+        status = await asyncio.wait_for(process.wait(), timeout=0.5)
+    except TimeoutError:
+        return {"ok": True}
+    if status != 0:
+        logger.warning(f"Media open command exited with status {status}")
+        raise HTTPException(status_code=500, detail=f"Command exited with status {status}")
+    return {"ok": True}
+
+
+@app.post("/media/open/{chat_ref}/{media_key}")
+async def launch_media_file(
+    media_key: str,
+    chat: ChatContext = Depends(require_chat),
+    user: UserContext = Depends(require_master),
+):
+    """Run MEDIA_OPEN_CMD on an entitled media file. 404 unless the operator configured it."""
+    if not config.media_open_cmd:
+        raise HTTPException(status_code=404, detail="Not configured")
+    return await _launch_media_command(config.media_open_cmd, chat, media_key, inline_only=True)
+
+
+@app.post("/media/open-path/{chat_ref}/{media_key}")
+async def launch_media_folder(
+    media_key: str,
+    chat: ChatContext = Depends(require_chat),
+    user: UserContext = Depends(require_master),
+):
+    """Run MEDIA_OPEN_PATH_CMD for an entitled media file. 404 unless the operator configured it."""
+    if not config.media_open_path_cmd:
+        raise HTTPException(status_code=404, detail="Not configured")
+    return await _launch_media_command(config.media_open_path_cmd, chat, media_key, inline_only=False)
+
+
+@app.get("/api/search/messages")
+async def search_messages(
+    q: str = Query(..., min_length=1, max_length=500),
+    user: UserContext = Depends(require_auth),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0, le=5000),
+):
+    """Message text across every chat the caller may see — the sidebar's Messages section.
+
+    Word-prefix matching over the full-text index, newest first. Restricted
+    viewers are filtered in SQL through the same ChatScope as the chat list
+    and the tag view, so this route can never widen what a viewer sees. Each
+    row names its chat the way the chat list does (title, or first/last name
+    for a private chat) and addresses the jump by ref, never by id.
+    """
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not available")
+    try:
+        payload = await db.search_messages_global(q, scope=_chat_scope(user), limit=limit, offset=offset)
+    except Exception as e:
+        # Type name only: SQLAlchemy exception text can echo statement
+        # parameters — the search text and the viewer's scope grants.
+        logger.error(f"Error searching messages: {type(e).__name__}")
+        if _is_db_connection_error(e):
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    results = []
+    for row in payload["results"]:
+        results.append(
+            {
+                "id": row["id"],
+                "date": row["date"],
+                "text": row["text"],
+                "sender_name": row["sender_name"],
+                "is_deleted": row["is_deleted"],
+                "topic_title": row["topic_title"],
+                "chat": {
+                    "ref": row["chat_ref"],
+                    "title": row["chat_title"],
+                    "first_name": row["chat_first_name"],
+                    "last_name": row["chat_last_name"],
+                    "username": row["chat_username"],
+                    "type": row["chat_type"],
+                    "is_forum": row["chat_is_forum"],
+                    "avatar_url": _chat_avatar_url(row["chat_id"], row["chat_type"], row["chat_ref"]),
+                },
+            }
+        )
+    return {
+        "query": q,
+        "limit": limit,
+        "offset": offset,
+        "has_more": payload["has_more"],
+        "indexed": payload["indexed"],
+        "results": results,
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
     """Serve the main application page.
@@ -1701,6 +1931,8 @@ async def read_root():
     """
     html = (templates_dir / "index.html").read_text(encoding="utf-8")
     html = html.replace("__VIEWER_DEFAULT_THEME__", VIEWER_DEFAULT_THEME)
+    html = html.replace("__VIEWER_CHAT_BACKGROUND__", _chat_background_css(VIEWER_CHAT_BACKGROUND))
+    html = html.replace("__VIEWER_MEDIA_OPEN__", json.dumps(_media_open_capabilities()))
     return HTMLResponse(
         html,
         headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
@@ -2218,6 +2450,23 @@ def _encode_media_key(media_key: str) -> str:
     return quote(media_key, safe="")
 
 
+def _chat_avatar_url(chat_id: int | None, chat_type: str | None, ref: str | None) -> str | None:
+    """Ref-addressed avatar URL when an avatar is cached, else None.
+
+    The avatar bytes route re-resolves at serve time; this only decides whether
+    the viewer renders an <img> at all. Any lookup failure reads as "no avatar"
+    rather than failing the row it decorates.
+    """
+    if chat_id is None or not ref:
+        return None
+    try:
+        return f"/media/avatar/{ref}" if _get_cached_avatar_path(chat_id, chat_type or "private") else None
+    except Exception as e:
+        # Type name only: an OSError's text carries the chat-derived path.
+        logger.error(f"Error finding avatar for a chat: {type(e).__name__}")
+        return None
+
+
 def _get_cached_avatar_path(chat_id: int, chat_type: str) -> str | None:
     """Get avatar path with caching."""
     global _avatar_cache, _avatar_cache_time
@@ -2312,12 +2561,7 @@ async def get_chats(
         # Ref-addressed avatar URLs; the avatar bytes route re-resolves at serve
         # time, this only decides whether the viewer renders an <img> at all.
         for chat in chats:
-            try:
-                avatar_path = _get_cached_avatar_path(chat["id"], chat.get("type", "private"))
-                chat["avatar_url"] = f"/media/avatar/{chat['ref']}" if avatar_path else None
-            except Exception as e:
-                logger.error(f"Error finding avatar for a chat: {e}")
-                chat["avatar_url"] = None
+            chat["avatar_url"] = _chat_avatar_url(chat.get("id"), chat.get("type"), chat.get("ref"))
 
         return {
             "chats": chats,
@@ -2331,6 +2575,27 @@ async def get_chats(
         if _is_db_connection_error(e):
             raise HTTPException(status_code=503, detail="Database temporarily unavailable")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/api/chats/{chat_ref}")
+async def get_chat(chat: ChatContext = Depends(require_chat)):
+    """One chat by its opaque ref, shaped like a chat-list row.
+
+    Deep links (push notifications, shared message links, global search hits)
+    can point at any entitled chat, not just the page the sidebar has loaded;
+    this is how the viewer resolves the rest without paging the whole list.
+    """
+    try:
+        row = await db.get_chat_by_ref(chat.ref, account_id=chat.account_id)
+    except Exception as e:
+        logger.error(f"Error fetching chat: {type(e).__name__}")
+        if _is_db_connection_error(e):
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    if not row:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    row["avatar_url"] = _chat_avatar_url(row["id"], row.get("type"), row["ref"])
+    return row
 
 
 @app.get("/api/chats/{chat_ref}/messages")
