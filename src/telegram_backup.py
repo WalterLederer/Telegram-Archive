@@ -15,7 +15,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
-from telethon import TelegramClient
+from telethon import TelegramClient, types
 from telethon.errors import (
     AuthKeyError,
     ChannelPrivateError,
@@ -3702,8 +3702,8 @@ class TelegramBackup:
         try:
             for attempt in range(MEDIA_REFRESH_MAX_ATTEMPTS):
                 # Start each attempt clean so a prior partial never corrupts it.
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+                # The single-stream transport resumes from an existing .part;
+                # the parallel transport cleans its target before starting.
                 try:
                     return await call_with_flood_retry(
                         self._fetch_media_bytes_bounded,
@@ -3774,12 +3774,6 @@ class TelegramBackup:
             # Defensive: the loop returns on success or raises on the final attempt.
             raise FileReferenceExpiredError(request=None)
         except BaseException:
-            # Never leave a partial .part behind on failure or cancellation.
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
             raise
 
     async def _process_media(self, message: Message, chat_id: int) -> dict | None:
@@ -4027,6 +4021,8 @@ class TelegramBackup:
         """
         async with absorb_media_floods(self.client, getattr(self.config, "media_flood_sleep_threshold", 0)):
             if self._should_parallelize(message, file_size):
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
                 if self._parallel_downloader is None:
                     self._parallel_downloader = ParallelDownloader(
                         self.client,
@@ -4040,7 +4036,43 @@ class TelegramBackup:
                     logger.info(
                         "Parallel download not applicable (%s); falling back to single-stream", describe_exception(exc)
                     )
-            return await self.client.download_media(message, tmp_path)
+
+            # WebPage media is handled by Telethon's high-level downloader.
+            # iter_download() cannot directly consume MessageMediaWebPage.
+            if isinstance(message.media, types.MessageMediaWebPage):
+                return await self.client.download_media(message, tmp_path)
+
+            if isinstance(message.media, types.MessageMediaPhoto):
+                return await self.client.download_media(message, tmp_path)
+
+            return await self._fetch_media_single_stream_resumable(message, tmp_path, file_size)
+
+    async def _fetch_media_single_stream_resumable(self, message, tmp_path: str, file_size: int):
+        """Resume the normal single-stream media download from an existing .part."""
+        part_size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+        if part_size > file_size:
+            with open(tmp_path, "wb"):
+                pass
+            part_size = 0
+
+        if part_size == file_size:
+            return tmp_path
+
+        mode = "ab" if part_size else "wb"
+        with open(tmp_path, mode) as fd:
+            async for chunk in self.client.iter_download(
+                message,
+                offset=part_size,
+                file_size=file_size,
+            ):
+                fd.write(chunk)
+
+        actual_size = os.path.getsize(tmp_path)
+        if actual_size != file_size:
+            raise IOError(
+                f"Incomplete media download: expected {file_size} bytes, got {actual_size}"
+            )
+        return tmp_path
 
     def _get_media_size(self, media) -> int:
         """Get estimated size of media object in bytes."""
